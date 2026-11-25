@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Search or Think? Demo: when should a small model search?</title>
+<meta name="description" content="Recorded test trajectories of Qwen2.5-0.5B search agents trained with GRPO under four rewards: plain, fixed penalty, SAAS and Soft-SAAS.">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f6f3; --surface: #ffffff; --surface-2: #f1f1ee; --line: #e3e3df; --line-2: #cfcfca;
+  --text: #191919; --text-2: #5c5c58; --text-3: #8a8a85; --accent: #2a5fb8;
+  --plain: #2A78D6; --saas: #EB6834; --soft: #1BAF7A; --fixed: #E6AA00; --ref: #8c8c87;
+  --good: #1f8a3b; --mid: #b7791f; --bad: #c2362f;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--sans); }
+a { color: var(--accent); }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px; }
+header.top { background: var(--surface); border-bottom: 1px solid var(--line); }
+header.top .wrap { padding-top: 28px; padding-bottom: 22px; }
+.eyebrow { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); margin: 0 0 6px; }
+h1 { font-size: 28px; line-height: 1.2; margin: 0 0 6px; letter-spacing: -.01em; }
+h1 small { display: block; font-size: 17px; font-weight: 500; color: var(--text-2); margin-top: 4px; letter-spacing: 0; }
+.byline { color: var(--text-2); margin: 8px 0 0; font-size: 14px; }
+.links { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+.links a, .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border: 1px solid var(--line-2);
+  border-radius: 8px; background: var(--surface); color: var(--text); text-decoration: none; font-size: 13.5px; cursor: pointer; font-family: inherit; }
+.links a:hover, .btn:hover { border-color: var(--text-3); }
+.btn.primary { background: var(--text); color: #fff; border-color: var(--text); }
+.btn:disabled { opacity: .45; cursor: default; }
+nav.tabs { position: sticky; top: 0; z-index: 5; background: rgba(246,246,243,.92); backdrop-filter: blur(6px); border-bottom: 1px solid var(--line); }
+nav.tabs .wrap { display: flex; gap: 18px; height: 44px; align-items: center; font-size: 14px; }
+nav.tabs a { color: var(--text-2); text-decoration: none; }
+nav.tabs a:hover { color: var(--text); }
+section { padding: 26px 0 10px; }
+h2 { font-size: 20px; margin: 0 0 4px; }
+.lede { color: var(--text-2); margin: 0 0 16px; max-width: 860px; }
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 6px 0 4px; }
+.finding { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font-size: 13.5px; color: var(--text-2); }
+.finding b { display: block; color: var(--text); font-size: 14.5px; margin-bottom: 3px; }
+
+/* explorer */
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: var(--surface); padding: 6px 11px; font: inherit; font-size: 13.5px; cursor: pointer; color: var(--text-2); }
+.seg button + button { border-left: 1px solid var(--line-2); }
+.seg button[aria-pressed="true"] { background: var(--text); color: #fff; }
+input[type=search], select { font: inherit; font-size: 13.5px; padding: 6px 10px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--surface); color: var(--text); }
+input[type=search] { min-width: 220px; flex: 1 1 220px; }
+.showcase { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: 13px; color: var(--text-2); }
+.chip { border: 1px solid var(--line-2); background: var(--surface-2); border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 12.5px; cursor: pointer; color: var(--text); }
+.chip:hover { border-color: var(--text-3); }
+.chip[aria-pressed="true"] { background: var(--text); color: #fff; border-color: var(--text); }
+.layout { display: grid; grid-template-columns: 300px 1fr; min-height: 560px; }
+.qlist { border-right: 1px solid var(--line); overflow: auto; max-height: 78vh; }
+.qlist .count { position: sticky; top: 0; background: var(--surface); font-size: 12px; color: var(--text-3); padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.qitem { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--line); background: none; padding: 8px 12px;
+  font: inherit; font-size: 13px; color: var(--text); cursor: pointer; line-height: 1.35; }
+.qitem:hover { background: var(--surface-2); }
+.qitem[aria-current="true"] { background: #eaf1fb; box-shadow: inset 3px 0 0 var(--accent); }
+.qitem .n { color: var(--text-3); font-variant-numeric: tabular-nums; margin-right: 4px; }
+.qitem .tags { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-3); }
+.more { margin: 10px 12px; }
+.qview { padding: 16px 18px 22px; min-width: 0; }
+.qhead .meta { font-size: 12.5px; color: var(--text-3); display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.qtext { font-size: 19px; line-height: 1.35; margin: 6px 0 8px; font-weight: 600; }
+.facts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.fact { border: 1px solid var(--line); background: var(--surface-2); border-radius: 8px; padding: 5px 10px; font-size: 13px; }
+.fact .k { color: var(--text-3); margin-right: 4px; }
+.why { border-left: 3px solid var(--accent); background: #f2f6fd; padding: 7px 12px; border-radius: 0 8px 8px 0; font-size: 13.5px; margin: 6px 0 12px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0 12px; }
+.toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+.toggle { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line-2); border-radius: 999px; padding: 3px 10px 3px 8px; font-size: 12.5px; cursor: pointer; user-select: none; background: var(--surface); }
+.toggle input { margin: 0; }
+.sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+label.check { font-size: 13px; color: var(--text-2); display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr)); gap: 12px; }
+.card { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); overflow: hidden; display: flex; flex-direction: column; }
+.card .ch { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--line); border-top: 4px solid var(--c); }
+.card .ch b { font-size: 14px; }
+.card .ch .stat { margin-left: auto; font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.card .desc { font-size: 12px; color: var(--text-3); padding: 6px 12px 0; }
+.steps { list-style: none; margin: 0; padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.step { transition: opacity .35s ease, transform .35s ease; }
+.step.pending { opacity: 0; transform: translateY(4px); }
+.step .k { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); display: block; }
+.query { font-family: var(--mono); font-size: 12.5px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; display: block; word-break: break-word; }
+.badge { display: inline-block; font-size: 10.5px; font-weight: 600; letter-spacing: .03em; padding: 1px 6px; border-radius: 4px; margin-left: 4px; vertical-align: 1px; text-transform: uppercase; }
+.badge.repeat { background: #fbe3e1; color: #8f241d; }
+.badge.hit { background: #e1f3e6; color: #17662c; }
+.docs { list-style: none; margin: 4px 0 0; padding: 0; font-size: 12.5px; }
+.docs li { margin: 2px 0; }
+.docs summary { cursor: pointer; color: var(--text-2); }
+.docs summary:hover { color: var(--text); }
+.docs p { margin: 4px 0 6px 14px; color: var(--text-2); font-size: 12.5px; }
+.answer { border-top: 1px dashed var(--line-2); padding-top: 8px; }
+.answer .a { font-size: 15px; font-weight: 600; word-break: break-word; }
+.verdict { font-size: 12.5px; margin-top: 2px; color: var(--text-2); }
+.verdict .ic { font-weight: 700; margin-right: 3px; }
+.ic.good { color: var(--good); } .ic.mid { color: var(--mid); } .ic.bad { color: var(--bad); }
+.note { font-size: 12px; color: var(--text-3); }
+pre.raw { white-space: pre-wrap; word-break: break-word; font: 11.5px/1.45 var(--mono); background: var(--surface-2); border-top: 1px solid var(--line); margin: 0; padding: 10px 12px; max-height: 260px; overflow: auto; color: var(--text-2); }
+pre.raw .tg { color: var(--accent); font-weight: 600; }
+.loading { padding: 40px; color: var(--text-3); text-align: center; }
+.kbd { font: 11px var(--mono); border: 1px solid var(--line-2); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--surface); }
+
+/* results */
+.viz-root { --surface-1: #ffffff; --grid: #ececea; --axis: #bdbdb8; }
+.chartbox { padding: 14px 16px 6px; }
+.chart-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.chart-title { font-weight: 600; font-size: 15px; }
+.chart-sub { font-size: 12.5px; color: var(--text-2); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--text-2); margin: 6px 0 2px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+svg.frontier { width: 100%; height: auto; display: block; }
+svg text { font-family: var(--sans); }
+.tip { position: fixed; pointer-events: none; background: #191919; color: #fff; font-size: 12.5px; padding: 7px 9px; border-radius: 6px; line-height: 1.4; z-index: 20; display: none; max-width: 260px; }
+table.res { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+table.res th, table.res td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+table.res th:first-child, table.res td:first-child { text-align: left; }
+table.res thead th { font-weight: 600; color: var(--text-2); font-size: 12px; }
+table.res tbody tr:hover { background: var(--surface-2); }
+.tablewrap { overflow-x: auto; padding: 4px 16px 14px; }
+.method { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.method .panel { padding: 14px 16px; font-size: 14px; color: var(--text-2); }
+.method h3 { margin: 0 0 6px; font-size: 15px; color: var(--text); }
+.formula { font-family: var(--mono); font-size: 12.5px; background: var(--surface-2); border-radius: 6px; padding: 6px 8px; color: var(--text); margin: 6px 0; display: block; }
+footer { color: var(--text-3); font-size: 12.5px; padding: 26px 0 40px; }
+@media (max-width: 860px) {
+  .layout { grid-template-columns: 1fr; }
+  .qlist { max-height: 260px; border-right: 0; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 23px; }
+}
+@media (prefers-reduced-motion: reduce) { .step { transition: none; } }
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <p class="eyebrow">MSAI 635 Reinforcement Learning · Final project demo</p>
+  <h1>Search or Think?<small>Soft knowledge boundaries for cost aware retrieval in small language models</small></h1>
+  <p class="byline">Dhairya Parikh and Kshitij Sahu</p>
+  <div class="links">
+    <a href="https://github.com/Kodezilla0725/search_or_think">Code and notebooks</a>
+    <a href="#explore">Explore the test questions</a>
+    <a href="#results">Results</a>
+  </div>
+</div></header>
+<nav class="tabs"><div class="wrap"><a href="#about">About</a><a href="#explore">Explorer</a><a href="#results">Results</a><a href="#method">Method</a></div></nav>
+
+<main class="wrap">
+<section id="about">
+  <h2>When should a 0.5B model search instead of answering from memory?</h2>
+  <p class="lede">We trained Qwen2.5-0.5B-Instruct with multi turn GRPO to answer questions with a BM25 search over Wikipedia, and compared four rewards from one shared starting policy. Every trajectory on this page is a recorded greedy run from our evaluation, on the real test questions. Nothing is generated in your browser.</p>
+  <div class="findings">
+    <div class="finding"><b>Soft-SAAS does not beat SAAS</b>Weighting the penalty by p(q) changed nothing measurable. The success criterion we set in the proposal fails on all three multi hop sets.</div>
+    <div class="finding"><b>Boundary penalties remove redundant searches</b>SAAS and Soft-SAAS cut 1.5 to 1.8 searches per question against plain GRPO, with no loss of accuracy.</div>
+    <div class="finding"><b>A fixed penalty kills search</b>At every λ we tried, search went to zero. GRPO's group normalisation cancels λ whenever all eight answers in a group are wrong.</div>
+    <div class="finding"><b>No policy learned <i>when</i> to search</b>Trained policies search as often on questions they can answer closed book as on the rest.</div>
+    <div class="finding"><b>One search is the frontier</b>No trained agent significantly beats a single search with the question as the query on four of the five test sets.</div>
+  </div>
+  <p class="note">This page shows seed 0 of each reward. The report has all seeds and the paired bootstrap statistics behind these statements.</p>
+</section>
+
+<section id="explore">
+  <h2>Explore the test questions</h2>
+  <p class="lede">Pick a question to see what each policy searched for, what BM25 returned, and what it answered. Press <span class="kbd">Replay</span> to watch the policies step through it side by side. <span class="kbd">←</span> <span class="kbd">→</span> move between questions.</p>
+  <div class="panel">
+    <div class="controls">
+      <div class="seg" id="setTabs" role="group" aria-label="Test set"></div>
+      <input type="search" id="search" placeholder="Search questions or gold answers" aria-label="Search questions">
+      <select id="filter" aria-label="Filter questions">
+        <option value="all">All questions</option>
+        <option value="known">Known closed book (p(q) ≥ 0.5)</option>
+        <option value="repeats">Plain GRPO repeats a query</option>
+        <option value="disagree">Trained policies disagree</option>
+        <option value="saaswin">SAAS right, plain GRPO wrong</option>
+        <option value="ragwin">One search right, every trained policy wrong</option>
+        <option value="allwrong">Every trained policy wrong</option>
+      </select>
+      <button class="btn" id="random">Random question</button>
+    </div>
+    <div class="showcase" id="showcase"><span>Try these:</span></div>
+    <div class="layout">
+      <div class="qlist" id="qlist"><div class="loading">Loading…</div></div>
+      <div class="qview" id="qview"><div class="loading">Loading…</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="results">
+  <h2>Accuracy against search cost</h2>
+  <p class="lede">One point per policy on the chosen test set: average searches per question against answer F1. The table below lists every set.</p>
+  <div class="panel viz-root">
+    <div class="chartbox">
+      <div class="chart-head">
+        <div><div class="chart-title" id="chartTitle">F1 against searches per question</div><div class="chart-sub">Seed 0 of each reward. Greedy decoding, BM25 top 3, at most 4 searches.</div></div>
+        <div class="seg" id="chartSets" role="group" aria-label="Test set for the chart"></div>
+      </div>
+      <div class="legend" id="legend"></div>
+      <svg class="frontier" id="frontier" viewBox="0 0 760 380" role="img" aria-label="Scatter plot of F1 against searches per question"></svg>
+    </div>
+    <div class="tablewrap"><table class="res" id="resTable"></table></div>
+    <div class="tablewrap"><div class="chart-title" style="margin:6px 0 4px">Does the policy search less on questions it already knows?</div>
+      <div class="chart-sub" style="margin-bottom:6px">Share of questions with at least one search: on questions the start policy answers closed book (p(q) ≥ 0.5) / on all other questions. A policy that knows when to search has the first number well below the second.</div>
+      <table class="res" id="qorTable"></table></div>
+  </div>
+</section>
+
+<section id="method">
+  <h2>Method in brief</h2>
+  <div class="method">
+    <div class="panel"><h3>Environment</h3>The policy writes <code>&lt;think&gt;</code>, <code>&lt;search&gt;</code> and <code>&lt;answer&gt;</code> blocks. Each query returns the top 3 BM25 passages from 21M Wikipedia passages (DPR split), at most 4 searches per question. Retrieved text is masked from the loss.</div>
+    <div class="panel"><h3>Training</h3>TRL's GRPOTrainer with our own multi turn rollout and colocated vLLM, 8 questions × 8 rollouts per step. A 200 step start policy (plain GRPO with forced exploration), then 100 steps per reward, all branched from the same checkpoint.</div>
+    <div class="panel"><h3>Rewards</h3>
+      <span class="formula">plain:  F1</span>
+      <span class="formula">fixed:  F1 − λ·N   (every rollout)</span>
+      <span class="formula">SAAS:   F1 − α·pen(N), only if F1 = 1</span>
+      <span class="formula">soft:   F1 − α·[ p·N + (1−p)·max(0, N − N_min) ]</span>
+      N is the number of searches, p = p(q) the start policy's closed book accuracy, α = 0.05.</div>
+    <div class="panel"><h3>Evaluation</h3>HotpotQA (1,000) and NQ (500) in domain; 2WikiMultihopQA (1,000), MuSiQue (500) and PopQA (500) out of domain. F1 against the gold answers; p(q) from 8 closed book samples, with a question counted as known when p(q) ≥ 0.5.</div>
+  </div>
+</section>
+<footer>Every number and trajectory on this page is computed from the saved evaluation outputs by the export notebook in the repository, and checked against the report's tables when exported.</footer>
+</main>
+<div class="tip" id="tip"></div>
+
+<script>
+"use strict";
+const COLORS = { plain: "var(--plain)", fixed: "var(--fixed)", saas: "var(--saas)", soft: "var(--soft)",
+                 base_agent: "var(--ref)", start_agent: "var(--ref)", start_rag: "var(--ref)", closed: "var(--ref)" };
+const TRAINED = ["plain", "fixed", "saas", "soft"];
+const KIND_LABEL = { repeats: "Repeated query", known: "Known closed book", fixed: "Fixed never searches",
+                     comparison: "Comparison question", rag: "One search wins" };
+const STOP_LABEL = { no_tag: "Stopped without an answer tag", fake_info: "Wrote its own search results, episode ended",
+                     search_limit: "Hit the search limit", max_turns: "Ran out of turns", too_long: "Ran out of context" };
+const S = { meta: null, data: {}, set: null, idx: 0, list: [], shown: new Set(TRAINED), raw: false, chartSet: "hotpotqa",
+            listLimit: 300, timers: [] };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// Same normalisation as sot/scoring.py (lowercase, no punctuation, no articles), for the "contains the answer" marks.
+const PUNCT = new Set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~");
+function norm(s) {
+  s = String(s || "").normalize("NFKC").toLowerCase();
+  s = Array.from(s).filter((ch) => !PUNCT.has(ch)).join("");
+  return s.replace(/\b(a|an|the)\b/g, " ").split(/\s+/).filter(Boolean).join(" ");
+}
+const hasAnswer = (text, golds) => { const t = ` ${norm(text)} `; return golds.some((g) => norm(g) && t.includes(` ${norm(g)} `)); };
+const normQ = (q) => String(q || "").toLowerCase().split(/\s+/).filter(Boolean).join(" ");
+function repeatFlags(queries) { const seen = new Set(); return queries.map((q) => { const k = normQ(q); const r = !!k && seen.has(k); seen.add(k); return r; }); }
+const pol = (k) => S.meta.policies.find((p) => p.key === k) || { key: k, label: "Closed book (start policy)", desc: "" };
+
+async function getJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(`${url}: ${r.status}`); return r.json(); }
+async function loadSet(ds) {
+  if (!S.data[ds]) {
+    const d = await getJSON(`data/q_${ds}.json`);
+    d.byId = new Map(d.questions.map((q, i) => [q.id, i]));
+    S.data[ds] = d;
+  }
+  return S.data[ds];
+}
+
+/* ---------- explorer ---------- */
+function matches(d, i, filter, term) {
+  const q = d.questions[i], R = (k) => d.runs[k][i];
+  if (term && !(q.q.toLowerCase().includes(term) || q.golds.some((g) => g.toLowerCase().includes(term)) || q.id.toLowerCase() === term)) return false;
+  switch (filter) {
+    case "known": return q.p !== null && q.p >= S.meta.known_threshold;
+    case "repeats": return !!R("plain") && repeatFlags(R("plain").s.map((s) => s[0])).some(Boolean);
+    case "disagree": { const a = TRAINED.map((k) => R(k) && norm(R(k).a)); return new Set(a).size > 1; }
+    case "saaswin": return R("saas") && R("plain") && R("saas").f1 === 1 && R("plain").f1 === 0;
+    case "ragwin": return R("start_rag") && R("start_rag").f1 === 1 && TRAINED.every((k) => R(k) && R(k).f1 === 0);
+    case "allwrong": return TRAINED.every((k) => R(k) && R(k).f1 === 0);
+    default: return true;
+  }
+}
+function rebuildList() {
+  const d = S.data[S.set], f = $("filter").value, term = $("search").value.trim().toLowerCase();
+  S.list = [];
+  for (let i = 0; i < d.questions.length; i++) if (matches(d, i, f, term)) S.list.push(i);
+  renderList();
+}
+function renderList() {
+  const d = S.data[S.set], box = $("qlist");
+  const items = S.list.slice(0, S.listLimit).map((i) => {
+    const q = d.questions[i];
+    const right = TRAINED.filter((k) => d.runs[k][i] && d.runs[k][i].f1 === 1).length;
+    const tags = [q.p !== null && q.p >= S.meta.known_threshold ? "known closed book" : null, `${right}/4 trained right`].filter(Boolean).join(" · ");
+    return `<button class="qitem" data-i="${i}" aria-current="${i === S.idx}"><span class="n">${i + 1}.</span>${esc(q.q)}<span class="tags">${tags}</span></button>`;
+  }).join("");
+  const more = S.list.length > S.listLimit ? `<button class="btn more" id="more">Show ${Math.min(300, S.list.length - S.listLimit)} more</button>` : "";
+  box.innerHTML = `<div class="count">${S.list.length} of ${d.questions.length} questions</div>${items || '<div class="loading">No question matches.</div>'}${more}`;
+  box.querySelectorAll(".qitem").forEach((b) => b.addEventListener("click", () => selectQ(+b.dataset.i)));
+  if ($("more")) $("more").addEventListener("click", () => { S.listLimit += 300; renderList(); });
+}
+function markCurrent() {
+  $("qlist").querySelectorAll(".qitem").forEach((b) => b.setAttribute("aria-current", String(+b.dataset.i === S.idx)));
+  const cur = $("qlist").querySelector('.qitem[aria-current="true"]');
+  if (cur) { const box = $("qlist"), top = cur.offsetTop, h = cur.offsetHeight;
+    if (top < box.scrollTop + 30 || top + h > box.scrollTop + box.clientHeight) box.scrollTop = top - 60; }
+}
+function verdict(r) {
+  if (!r.a && r.stop !== "answer") return `<span class="ic bad">✗</span>no answer`;
+  if (r.f1 >= 1) return `<span class="ic good">✓</span>correct`;
+  if (r.f1 > 0) return `<span class="ic mid">≈</span>partly right, F1 ${r.f1.toFixed(2)}`;
+  return `<span class="ic bad">✗</span>wrong`;
+}
+function rawText(t) {
+  return esc(t).replace(/&lt;(\/?)(think|search|answer|info)&gt;/g, (m) => `<span class="tg">${m}</span>`);
+}
+function card(key, r, q, d) {
+  const p = pol(key);
+  if (!r) return `<div class="card" style="--c:${COLORS[key]}"><div class="ch"><span class="sw" style="background:${COLORS[key]}"></span><b>${esc(p.label)}</b></div><div class="steps"><span class="note">Not evaluated on this question.</span></div></div>`;
+  const reps = repeatFlags(r.s.map((s) => s[0]));
+  const distinct = new Set(r.s.map((s) => normQ(s[0]))).size;
+  const stat = r.n === 0 ? "no search" : `${r.n} search${r.n > 1 ? "es" : ""}${distinct < r.n ? `, ${distinct} distinct` : ""}`;
+  const steps = r.s.map((s, j) => {
+    const docs = s[1].map((pid) => { const [title, text] = d.passages[pid];
+      const hit = hasAnswer(text, q.golds) ? '<span class="badge hit">has answer</span>' : "";
+      return `<li><details><summary>${esc(title) || "(untitled)"}${hit}</summary><p>${esc(text)}</p></details></li>`; }).join("");
+    const label = key === "start_rag" && j === 0 ? "Search (the question, given)" : `Search ${j + 1}`;
+    return `<li class="step" data-step="${j}"><span class="k">${label}${reps[j] ? '<span class="badge repeat">repeat</span>' : ""}</span><span class="query">${esc(s[0])}</span><ul class="docs">${docs}</ul></li>`;
+  }).join("");
+  const stop = r.stop !== "answer" && STOP_LABEL[r.stop] ? `<div class="note">${STOP_LABEL[r.stop]}</div>` : "";
+  const answer = `<li class="step answer" data-step="${r.s.length}"><span class="k">Answer</span><div class="a">${r.a ? esc(r.a) : "(none)"}</div><div class="verdict">${verdict(r)}</div>${stop}</li>`;
+  const none = r.n === 0 ? `<li class="step" data-step="-1"><span class="note">Answered without searching.</span></li>` : "";
+  return `<div class="card" style="--c:${COLORS[key]}" data-key="${key}">
+    <div class="ch"><span class="sw" style="background:${COLORS[key]}"></span><b>${esc(p.label)}</b><span class="stat">${stat}</span></div>
+    <div class="desc">${esc(p.desc)}</div>
+    <ol class="steps">${none}${steps}${answer}</ol>
+    ${S.raw ? `<pre class="raw">${rawText(r.t)}</pre>` : ""}
+  </div>`;
+}
+function renderQ() {
+  stopReplay();
+  const d = S.data[S.set], i = S.idx, q = d.questions[i];
+  if (!q) { $("qview").innerHTML = '<div class="loading">No question.</div>'; return; }
+  const setLabel = S.meta.sets.find((s) => s.key === S.set).label;
+  const sc = S.meta.showcase.find((s) => s.id === q.id);
+  const known = q.p !== null && q.p >= S.meta.known_threshold;
+  const pTxt = q.p === null ? "not measured" : `${q.p.toFixed(2)}${known ? " · known closed book" : ""}`;
+  const cb = q.cb === null ? "" : `<div class="fact"><span class="k">Start policy, closed book:</span>${esc(q.cb) || "(none)"} <span class="ic ${q.cb_ok ? "good" : "bad"}">${q.cb_ok ? "✓" : "✗"}</span></div>`;
+  const all = S.meta.policies.map((p) => p.key);
+  const toggles = all.map((k) => `<label class="toggle"><input type="checkbox" data-k="${k}" ${S.shown.has(k) ? "checked" : ""}><span class="sw" style="background:${COLORS[k]}"></span>${esc(pol(k).label)}</label>`).join("");
+  const keys = all.filter((k) => S.shown.has(k));
+  $("qview").innerHTML = `
+    <div class="qhead">
+      <div class="meta"><span>${esc(setLabel)} · question ${i + 1} of ${d.questions.length}</span><span>id ${esc(q.id)}</span></div>
+      <div class="qtext">${esc(q.q)}</div>
+      <div class="facts">
+        <div class="fact"><span class="k">Gold:</span>${q.golds.map(esc).join(" / ")}</div>
+        <div class="fact"><span class="k">p(q):</span>${pTxt}</div>${cb}
+      </div>
+      ${sc ? `<div class="why"><b>${esc(KIND_LABEL[sc.kind] || sc.kind)}.</b> ${esc(sc.why)}</div>` : ""}
+    </div>
+    <div class="toolbar">
+      <button class="btn primary" id="replay">▶ Replay</button>
+      <button class="btn" id="prev" ${S.list.indexOf(i) <= 0 ? "disabled" : ""}>← Previous</button>
+      <button class="btn" id="next" ${S.list.indexOf(i) >= S.list.length - 1 ? "disabled" : ""}>Next →</button>
+      <label class="check"><input type="checkbox" id="raw" ${S.raw ? "checked" : ""}> Show what the model wrote</label>
+      <button class="btn" id="copy">Copy link</button>
+    </div>
+    <div class="toggles" style="margin-bottom:12px">${toggles}</div>
+    <div class="cards" id="cards">${keys.map((k) => card(k, d.runs[k][i], q, d)).join("")}</div>`;
+  $("replay").addEventListener("click", replay);
+  $("prev").addEventListener("click", () => step(-1));
+  $("next").addEventListener("click", () => step(1));
+  $("raw").addEventListener("change", (e) => { S.raw = e.target.checked; renderQ(); });
+  $("copy").addEventListener("click", () => { navigator.clipboard?.writeText(location.href); $("copy").textContent = "Copied"; });
+  $("qview").querySelectorAll(".toggle input").forEach((c) => c.addEventListener("change", () => {
+    c.checked ? S.shown.add(c.dataset.k) : S.shown.delete(c.dataset.k); renderQ(); }));
+  document.querySelectorAll("#showcase .chip").forEach((c) => c.setAttribute("aria-pressed", String(c.dataset.id === q.id)));
+  history.replaceState(null, "", `#q=${encodeURIComponent(S.set)}/${encodeURIComponent(q.id)}`);
+  markCurrent();
+}
+function stopReplay() { S.timers.forEach(clearTimeout); S.timers = []; }
+function replay() {
+  stopReplay();
+  const steps = [...document.querySelectorAll("#cards .step")];
+  steps.forEach((s) => s.classList.add("pending"));
+  const max = Math.max(0, ...steps.map((s) => +s.dataset.step));
+  for (let t = -1; t <= max; t++) {
+    S.timers.push(setTimeout(() => {
+      document.querySelectorAll("#cards .card").forEach((c) => {
+        const list = [...c.querySelectorAll(".step")];
+        const last = Math.max(...list.map((s) => +s.dataset.step));
+        // each card shows its step t; a card that has finished shows its answer when it gets there
+        list.filter((s) => +s.dataset.step === t || (+s.dataset.step === last && t >= last)).forEach((s) => s.classList.remove("pending"));
+      });
+    }, 250 + (t + 1) * 900));
+  }
+}
+function selectQ(i) { S.idx = i; renderQ(); }
+function step(delta) { const pos = S.list.indexOf(S.idx); const n = S.list[pos + delta]; if (n !== undefined) selectQ(n); }
+async function selectSet(ds, keepIdx) {
+  S.set = ds; S.listLimit = 300;
+  document.querySelectorAll("#setTabs button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.ds === ds)));
+  $("qlist").innerHTML = '<div class="loading">Loading…</div>'; $("qview").innerHTML = '<div class="loading">Loading questions…</div>';
+  try { await loadSet(ds); } catch (e) { $("qview").innerHTML = `<div class="loading">Could not load ${esc(ds)}: ${esc(e.message)}</div>`; return; }
+  rebuildList();
+  S.idx = keepIdx !== undefined ? keepIdx : (S.list[0] ?? 0);
+  renderQ();
+}
+async function goTo(ds, id) {
+  if (S.set !== ds) { $("filter").value = "all"; $("search").value = ""; await selectSet(ds, 0); }
+  const i = S.data[ds].byId.get(id);
+  if (i === undefined) return;
+  if (!S.list.includes(i)) { $("filter").value = "all"; $("search").value = ""; rebuildList(); }
+  selectQ(i);
+}
+
+/* ---------- results ---------- */
+const SHAPES = { plain: "circle", saas: "square", soft: "triangle", fixed: "diamond", base_agent: "x", start_agent: "plus", start_rag: "ring", closed: "box" };
+function shape(kind, x, y, r, fill) {
+  const ring = 'stroke="var(--surface-1)" stroke-width="2"';
+  switch (kind) {
+    case "circle": return `<circle cx="${x}" cy="${y}" r="${r}" fill="${fill}" ${ring}/>`;
+    case "square": return `<rect x="${x - r}" y="${y - r}" width="${2 * r}" height="${2 * r}" rx="1.5" fill="${fill}" ${ring}/>`;
+    case "triangle": return `<path d="M${x} ${y - r * 1.2} L${x + r * 1.1} ${y + r * .85} L${x - r * 1.1} ${y + r * .85} Z" fill="${fill}" ${ring}/>`;
+    case "diamond": return `<path d="M${x} ${y - r * 1.25} L${x + r * 1.25} ${y} L${x} ${y + r * 1.25} L${x - r * 1.25} ${y} Z" fill="${fill}" ${ring}/>`;
+    case "x": return `<path d="M${x - r} ${y - r} L${x + r} ${y + r} M${x + r} ${y - r} L${x - r} ${y + r}" stroke="${fill}" stroke-width="2.2" stroke-linecap="round"/>`;
+    case "plus": return `<path d="M${x - r - 1} ${y} L${x + r + 1} ${y} M${x} ${y - r - 1} L${x} ${y + r + 1}" stroke="${fill}" stroke-width="2.4" stroke-linecap="round"/>`;
+    case "ring": return `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--surface-1)" stroke="${fill}" stroke-width="2.2"/>`;
+    default: return `<rect x="${x - r}" y="${y - r}" width="${2 * r}" height="${2 * r}" fill="var(--surface-1)" stroke="${fill}" stroke-width="2.2"/>`;
+  }
+}
+const chartKeys = () => [...S.meta.policies.map((p) => p.key), "closed"].filter((k) => S.meta.metrics[k]);
+function renderLegend() {
+  $("legend").innerHTML = chartKeys().map((k) => `<span><svg width="16" height="16" viewBox="0 0 16 16">${shape(SHAPES[k], 8, 8, 4.5, COLORS[k])}</svg>${esc(pol(k).label)}</span>`).join("");
+}
+const measure = (() => { const c = document.createElement("canvas").getContext("2d");
+  return (t, px = 11.5) => { c.font = `${px}px ${getComputedStyle(document.body).fontFamily}`; return c.measureText(t).width; }; })();
+function renderChart() {
+  const ds = S.chartSet, keys = chartKeys(), M = S.meta.metrics, svg = $("frontier");
+  document.querySelectorAll("#chartSets button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.ds === ds)));
+  $("chartTitle").textContent = `F1 against searches per question, ${S.meta.sets.find((s) => s.key === ds).label}`;
+  const pts = keys.filter((k) => M[k][ds]).map((k) => ({ k, x: M[k][ds].sc, y: 100 * M[k][ds].f1, m: M[k][ds] }));
+  // drawn at the panel's real width, so 11.5px text stays 11.5px
+  const W = Math.max(340, Math.min(1000, svg.parentElement.clientWidth - 4)), H = W < 600 ? 320 : 380;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.style.maxWidth = `${W}px`;
+  const L = 48, R = 16, T = 12, B = 44;
+  const xmax = Math.max(4, Math.ceil(Math.max(...pts.map((p) => p.x)))), ys = pts.map((p) => p.y);
+  const ylo = Math.max(0, Math.floor((Math.min(...ys) - 2) / 5) * 5), yhi = Math.ceil((Math.max(...ys) + 2) / 5) * 5;
+  const X = (v) => L + (v + 0.15) / (xmax + 0.3) * (W - L - R), Y = (v) => T + (1 - (v - ylo) / (yhi - ylo)) * (H - T - B);
+  let g = "";
+  for (let v = ylo; v <= yhi + 1e-9; v += 5) g += `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--grid)" stroke-width="1"/><text x="${L - 8}" y="${Y(v) + 4}" font-size="11.5" text-anchor="end" fill="var(--text-2)">${v}</text>`;
+  for (let v = 0; v <= xmax; v++) g += `<line x1="${X(v)}" x2="${X(v)}" y1="${T}" y2="${H - B}" stroke="var(--grid)" stroke-width="1"/><text x="${X(v)}" y="${H - B + 18}" font-size="11.5" text-anchor="middle" fill="var(--text-2)">${v}</text>`;
+  g += `<line x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}" stroke="var(--axis)" stroke-width="1"/>`;
+  g += `<text x="${(L + W - R) / 2}" y="${H - 8}" font-size="12" text-anchor="middle" fill="var(--text-2)">Searches per question</text>`;
+  g += `<text transform="translate(13 ${(T + H - B) / 2}) rotate(-90)" font-size="12" text-anchor="middle" fill="var(--text-2)">F1 (%)</text>`;
+  // Direct labels: each tries spots around its point and takes the first that hits no other label or point.
+  const ptBox = pts.map((p) => ({ k: p.k, x: X(p.x) - 7, y: Y(p.y) - 7, w: 14, h: 14 }));
+  const over = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  const placed = [], prio = ["saas", "soft", "plain", "fixed", "start_rag", "start_agent", "base_agent", "closed"];
+  for (const p of [...pts].sort((a, b) => prio.indexOf(a.k) - prio.indexOf(b.k))) {
+    const px = X(p.x), py = Y(p.y), text = pol(p.k).label, w = measure(text) + 2, h = 13;
+    const cands = [[px + 10, py + 4], [px - 10 - w, py + 4], [px - w / 2, py - 11], [px - w / 2, py + 20]];
+    for (const dy of [15, -15, 30, -30, 45, -45, 60, -60]) cands.push([px + 14, py + 4 + dy], [px - 14 - w, py + 4 + dy]);
+    let pick = cands[0];
+    for (const [x, y] of cands) {
+      const box = { x, y: y - 10, w, h };
+      if (x < L + 2 || x + w > W - 2 || box.y < 0 || y > H - B - 2) continue;
+      if (placed.some((q) => over(box, q)) || ptBox.some((q) => q.k !== p.k && over(box, q))) continue;
+      pick = [x, y]; break;
+    }
+    placed.push({ k: p.k, text, x: pick[0], y: pick[1] - 10, w, h, px, py });
+  }
+  let marks = "", labels = "";
+  for (const p of pts) marks += `<g class="pt" data-k="${p.k}" tabindex="0">${shape(SHAPES[p.k], X(p.x), Y(p.y), 5.5, COLORS[p.k])}<circle cx="${X(p.x)}" cy="${Y(p.y)}" r="13" fill="transparent"/></g>`;
+  for (const l of placed) {
+    const cx = Math.max(l.x, Math.min(l.px, l.x + l.w)), cy = l.y + l.h / 2;
+    if (Math.hypot(cx - l.px, cy - l.py) > 16) labels += `<line x1="${l.px}" y1="${l.py}" x2="${cx}" y2="${cy}" stroke="var(--axis)" stroke-width="1"/>`;
+    labels += `<text x="${l.x}" y="${l.y + 10}" font-size="11.5" fill="var(--text)">${esc(l.text)}</text>`;
+  }
+  svg.innerHTML = g + labels + marks;
+  const tip = $("tip");
+  const show = (p, x, y) => { tip.style.display = "block"; tip.style.left = `${x + 12}px`; tip.style.top = `${y + 12}px`;
+    tip.innerHTML = `<b>${esc(pol(p.k).label)}</b><br>F1 ${p.y.toFixed(1)} · EM ${(100 * p.m.em).toFixed(1)}<br>${p.x.toFixed(2)} searches per question` +
+      (p.m.repeat != null ? `<br>${(100 * p.m.repeat).toFixed(0)}% of queries repeat an earlier one` : ""); };
+  svg.querySelectorAll(".pt").forEach((el) => {
+    const p = pts.find((q) => q.k === el.dataset.k);
+    el.addEventListener("mousemove", (e) => show(p, e.clientX, e.clientY));
+    el.addEventListener("focus", () => { const r = el.getBoundingClientRect(); show(p, r.right, r.top); });
+    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+    el.addEventListener("blur", () => { tip.style.display = "none"; });
+  });
+}
+function renderTables() {
+  const sets = S.meta.sets, M = S.meta.metrics, keys = chartKeys();
+  const f = (v, d = 1) => (v === null || v === undefined || Number.isNaN(v) ? "–" : v.toFixed(d));
+  $("resTable").innerHTML = `<thead><tr><th>Policy</th>${sets.map((s) => `<th colspan="2" style="text-align:center">${esc(s.label)}${s.in_domain ? "" : " *"}</th>`).join("")}</tr>
+    <tr><th></th>${sets.map(() => "<th>F1</th><th>searches</th>").join("")}</tr></thead>
+    <tbody>${keys.map((k) => `<tr><td><span class="sw" style="background:${COLORS[k]};margin-right:6px"></span>${esc(pol(k).label)}</td>${sets.map((s) => { const m = M[k][s.key]; return m ? `<td>${f(100 * m.f1)}</td><td>${f(m.sc, 2)}</td>` : "<td>–</td><td>–</td>"; }).join("")}</tr>`).join("")}</tbody>
+    <tfoot><tr><td colspan="${1 + 2 * sets.length}" class="note" style="text-align:left">* out of domain. F1 in %. Searches: average per question.</td></tr></tfoot>`;
+  const qk = keys.filter((k) => k !== "closed" && k !== "start_rag");
+  const qsets = sets.filter((s) => s.known);
+  $("qorTable").innerHTML = `<thead><tr><th>Policy</th>${qsets.map((s) => `<th>${esc(s.label)} (${s.known} known)</th>`).join("")}</tr></thead>
+    <tbody>${qk.map((k) => `<tr><td><span class="sw" style="background:${COLORS[k]};margin-right:6px"></span>${esc(pol(k).label)}</td>${qsets.map((s) => { const m = M[k][s.key]; return m && m.search_known != null ? `<td>${f(m.search_known, 2)} / ${f(m.search_rest, 2)}</td>` : "<td>–</td>"; }).join("")}</tr>`).join("")}</tbody>`;
+}
+
+/* ---------- start ---------- */
+async function init() {
+  try { S.meta = await getJSON("data/meta.json"); }
+  catch (e) { $("qview").innerHTML = `<div class="loading">Could not load the data (${esc(e.message)}).</div>`; $("qlist").innerHTML = ""; return; }
+  const tabs = (el, fn) => { el.innerHTML = S.meta.sets.map((s) => `<button data-ds="${s.key}" aria-pressed="false">${esc(s.label)}</button>`).join("");
+    el.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => fn(b.dataset.ds))); };
+  tabs($("setTabs"), (ds) => { $("filter").value = "all"; $("search").value = ""; selectSet(ds); });
+  tabs($("chartSets"), (ds) => { S.chartSet = ds; renderChart(); });
+  const sc = $("showcase");
+  S.meta.showcase.forEach((s) => { const b = document.createElement("button"); b.className = "chip"; b.dataset.id = s.id;
+    b.textContent = `${KIND_LABEL[s.kind] || s.kind} · ${S.meta.sets.find((x) => x.key === s.set).label}`; b.title = s.why;
+    b.addEventListener("click", () => goTo(s.set, s.id)); sc.appendChild(b); });
+  if (!S.meta.showcase.length) sc.style.display = "none";
+  let t; $("search").addEventListener("input", () => { clearTimeout(t); t = setTimeout(() => { S.listLimit = 300; rebuildList(); if (S.list.length && !S.list.includes(S.idx)) selectQ(S.list[0]); }, 180); });
+  $("filter").addEventListener("change", () => { S.listLimit = 300; rebuildList(); if (S.list.length && !S.list.includes(S.idx)) selectQ(S.list[0]); });
+  $("random").addEventListener("click", () => { if (S.list.length) selectQ(S.list[Math.floor(Math.random() * S.list.length)]); });
+  document.addEventListener("keydown", (e) => {
+    if (e.target.matches("input, select, textarea")) return;
+    if (e.key === "ArrowRight") step(1); else if (e.key === "ArrowLeft") step(-1);
+  });
+  renderLegend(); renderChart(); renderTables();
+  let rz; window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(renderChart, 150); });
+  const m = decodeURIComponent(location.hash).match(/^#q=([^/]+)\/(.+)$/);
+  const first = S.meta.showcase[0];
+  if (m && S.meta.sets.some((s) => s.key === m[1])) { await selectSet(m[1], 0); await goTo(m[1], m[2]); }
+  else if (first) { await selectSet(first.set, 0); await goTo(first.set, first.id); }
+  else await selectSet(S.meta.sets[0].key);
+}
+init();
+</script>
+</body>
+</html>
