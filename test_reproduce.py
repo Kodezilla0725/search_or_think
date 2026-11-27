@@ -208,3 +208,53 @@ def test_download_resumes_after_a_dropped_connection(tmp_path):
         assert open(path, "rb").read() == payload and requests == [0, 100_000]
     finally:
         srv.shutdown()
+
+
+def test_bfloat16_follows_compute_capability_not_torch(monkeypatch):
+    import sys
+    import types
+
+    def fake_torch(name, capability):
+        cuda = types.SimpleNamespace(is_available=lambda: True, get_device_name=lambda i: name,
+                                     get_device_capability=lambda i: capability, is_bf16_supported=lambda: True)
+        return types.SimpleNamespace(cuda=cuda)
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch("Tesla T4", (7, 5)))  # torch says True: emulation
+    env = rp.environment()
+    assert env["gpu"] == "Tesla T4" and env["capability"] == "7.5" and env["bf16"] is False
+    monkeypatch.setitem(sys.modules, "torch", fake_torch("NVIDIA L4", (8, 9)))
+    assert rp.environment()["bf16"] is True
+
+
+def test_root_cause_finds_the_first_error():
+    lines = ["INFO loading", "(EngineCore pid=1) ValueError: Bfloat16 is only supported on GPUs with compute "
+             "capability of at least 8.0. Your Tesla T4 GPU has compute capability 7.5.", "Traceback (most recent "
+             "call last):", "RuntimeError: Engine core initialization failed. See root cause above."]
+    assert rp.root_cause(lines).startswith("(EngineCore pid=1) ValueError: Bfloat16 is only supported")
+    assert rp.root_cause(["just text"]) == "just text" and rp.root_cause([]) == "no output"
+
+
+def test_pick_dtype_falls_back_and_respects_a_forced_choice(monkeypatch, tmp_path):
+    tried = []
+
+    def check(work, model, dtype):
+        tried.append(dtype)
+        return (dtype == "float32", "ENGINE_OK" if dtype == "float32" else "ValueError: no")
+
+    monkeypatch.setattr(rp, "engine_check", check)
+    assert rp.pick_dtype(str(tmp_path), "m", {"bf16": False})[0] == "float32" and tried == ["float16", "float32"]
+    tried.clear()
+    assert rp.pick_dtype(str(tmp_path), "m", {"bf16": True})[0] is None and tried == ["bfloat16"]
+    tried.clear()
+    assert rp.pick_dtype(str(tmp_path), "m", {"bf16": True}, "float32")[0] == "float32" and tried == ["float32"]
+
+
+def test_an_early_stop_still_writes_a_report(monkeypatch, tmp_path):
+    import sys
+    monkeypatch.setattr(rp, "environment", lambda: {"gpu": None, "bf16": False, "warnings": []})
+    monkeypatch.setattr(sys, "argv", ["reproduce.py", "--work", str(tmp_path)])
+    with pytest.raises(SystemExit) as e:
+        rp.main()
+    assert e.value.code == 1
+    report = json.load(open(tmp_path / "reproduce_report.json"))
+    assert report["verdict"].startswith("FAIL: stopped early. No GPU found")

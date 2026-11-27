@@ -5,21 +5,24 @@ notebooks/10_reproduce_results.ipynb installs the same versions in Colab and run
 free T4 GPU, which has no bfloat16: the policies then run in float16, and more answers differ from the recorded run.
 
 Steps
-  1. environment   GPU and library versions; bfloat16 where the GPU has it, else float16 (--dtype overrides).
+  1. environment   GPU and library versions.
   2. unit tests    test_sot.py, test_export_site.py, test_reproduce.py: scoring, rewards, agent loop, analysis,
                    export, and this script's comparison.
-  3. retriever     setup_retriever.sh starts the BM25 server over Pyserini's prebuilt wikipedia-dpr-100w index. Then
-                   queries that the recorded runs issued are searched again and the top 3 passages are compared with
-                   the passages recorded at evaluation time.
-  4. checkpoints   the base model from the Hugging Face Hub, the five trained policies from this repo's release.
-  5. inference     run_inference.py with the same commands, task grouping and order as the original evaluation
+  3. checkpoints   the base model from the Hugging Face Hub, the five trained policies from this repo's release.
+  4. vLLM check    loads the model and answers one prompt in bfloat16 where the GPU supports it (compute
+                   capability 8.0 and up), else float16, else float32 (--dtype forces one). Fails within minutes
+                   rather than after the search index is set up.
+  5. retriever     setup_retriever.sh starts the BM25 server over Pyserini's prebuilt wikipedia-dpr-100w index.
+                   Then queries that the recorded runs issued are searched again and the top 3 passages are compared
+                   with the passages recorded at evaluation time.
+  6. inference     run_inference.py with the same commands, task grouping and order as the original evaluation
                    (notebooks 05 to 08).
-  6. noise         the start policy's in domain evaluation runs a second time, to measure how much two runs of the
+  7. noise         the start policy's in domain evaluation runs a second time, to measure how much two runs of the
                    same command differ (vLLM's greedy decoding is not bit for bit repeatable, see below).
-  7. comparison    every policy and test set against the recorded run (docs/data, the demo page's data) with a
+  8. comparison    every policy and test set against the recorded run (docs/data, the demo page's data) with a
                    paired bootstrap over the same questions, as in the report; the two baselines without recorded
-                   answers against the report's appendix table. Writes <work>/reproduce_report.json, prints PASS or
-                   FAIL.
+                   answers against the report's appendix table. Writes <work>/reproduce_report.json (also when a
+                   step stops the run early) and prints PASS or FAIL.
 
 usage: python reproduce.py [--work /content/repro] [--policies base_0.5B,stageA2,...] [--compare_only]
 """
@@ -30,6 +33,7 @@ import http.client
 import importlib.metadata
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -125,7 +129,10 @@ def environment():
         import torch
         cuda = torch.cuda.is_available()
         info["gpu"] = torch.cuda.get_device_name(0) if cuda else None
-        info["bf16"] = bool(cuda and torch.cuda.is_bf16_supported())
+        # vLLM runs bfloat16 only from compute capability 8.0 (A100, L4). torch.cuda.is_bf16_supported() is no
+        # test for that: it also counts the T4's slow emulation and returns True there.
+        info["capability"] = ".".join(map(str, torch.cuda.get_device_capability(0))) if cuda else None
+        info["bf16"] = bool(cuda and torch.cuda.get_device_capability(0) >= (8, 0))
     except ImportError:
         info["gpu"], info["bf16"] = None, False
     info["warnings"] = [f"{k} is {info.get(k)}, the original evaluation used {v}"
@@ -140,7 +147,7 @@ def unit_tests():
     return {"passed": r.returncode == 0, "summary": tail[0]}
 
 
-# 3. retriever
+# 5. retriever (runs after steps 3 and 4)
 def start_retriever(work):
     # shortcut: setup_retriever.sh is the Colab script the evaluation used (Java 21, a pyserini venv and the index
     # under /content); it is reused unchanged rather than generalised to other machines.
@@ -183,7 +190,7 @@ def retrieval_check(n):
             "agreement": round(1 - len(diff) / len(sample), 4), "examples": diff[:5]}
 
 
-# 4. checkpoints
+# 3. checkpoints
 def find_model_dir(root):
     for d, dirs, files in os.walk(root):
         dirs[:] = [x for x in dirs if not x.startswith("__MACOSX")]  # Finder's zip adds resource fork copies
@@ -248,7 +255,51 @@ def fetch_checkpoint(tag, work, release):
     return found
 
 
-# 5. inference
+# 4. vLLM check
+ENGINE_CHECK = """
+import sys
+from vllm import LLM, SamplingParams
+llm = LLM(model=sys.argv[1], dtype=sys.argv[2], max_model_len=2048, gpu_memory_utilization=0.5, seed=0,
+          enforce_eager=True)
+out = llm.generate(["The capital of France is"], SamplingParams(temperature=0.0, max_tokens=8))
+print("ENGINE_OK", repr(out[0].outputs[0].text))
+"""
+
+
+def root_cause(lines):
+    """The first error message in a log (vLLM prints the real cause well above its final traceback)."""
+    errors = [x.strip() for x in lines if re.search(r"\b[A-Za-z]*(Error|Exception): ", x)]
+    return errors[0][:300] if errors else (lines[-1].strip()[:300] if lines else "no output")
+
+
+def engine_check(work, model_path, dtype):
+    """Loads the model in vLLM with this precision and answers one prompt. Returns (ok, message)."""
+    os.makedirs(f"{work}/logs", exist_ok=True)
+    path = f"{work}/logs/engine_check_{dtype}.log"
+    with open(path, "w") as f:
+        r = subprocess.run([sys.executable, "-c", ENGINE_CHECK, model_path, dtype], cwd=REPO, stdout=f,
+                           stderr=subprocess.STDOUT)
+    with open(path) as f:
+        lines = f.read().splitlines()
+    ok = [x for x in lines if x.startswith("ENGINE_OK")]
+    return (True, ok[0]) if r.returncode == 0 and ok else (False, f"{root_cause(lines)} (full log: {path})")
+
+
+def pick_dtype(work, model_path, env, forced=None):
+    """bfloat16 where vLLM supports it (compute capability 8.0 and up), else float16, else float32: the first that
+    loads and answers. Returns (dtype, notes)."""
+    candidates = [forced] if forced else (["bfloat16"] if env["bf16"] else ["float16", "float32"])
+    notes = []
+    for dtype in candidates:
+        ok, msg = engine_check(work, model_path, dtype)
+        notes.append(f"{dtype}: {msg}")
+        log(f"vLLM check in {dtype}: {'ok, ' if ok else 'FAILED, '}{msg}")
+        if ok:
+            return dtype, notes
+    return None, notes
+
+
+# 6. inference
 def plan(models):
     """(output name, task list, out of domain?) per run_inference.py process, in the order they run."""
     jobs = []
@@ -286,15 +337,16 @@ def run_inference(work, name, model_path, tasks, ood, fresh, dtype="bfloat16"):
     with open(path) as f:
         lines = f.read().splitlines()
     if r.returncode != 0:
-        print("\n".join(lines[-30:]))
-        raise RuntimeError(f"run_inference.py failed for {name} ({','.join(tasks)}); see {path}")
+        print("\n".join(lines[-15:]))
+        raise RuntimeError(f"run_inference.py failed for {name} ({','.join(tasks)}): {root_cause(lines)} (full log: "
+                           f"{path})")
     for line in lines:
         if line.startswith(f"[{name}] "):
             log(line)
     return (time.time() - t0) / 60
 
 
-# 6. noise
+# 7. noise
 def noise_check(work, model_path, fresh, dtype="bfloat16", n_boot=2000):
     """Evaluates the start policy in domain a second time and compares the two runs: the noise between two runs of
     the same command, measured rather than assumed."""
@@ -311,7 +363,7 @@ def noise_check(work, model_path, fresh, dtype="bfloat16", n_boot=2000):
     return out
 
 
-# 7. comparison
+# 8. comparison
 def recorded_rows(rec_key):
     """id -> (answer, searches) for one recorded policy, from the demo data."""
     out = {}
@@ -403,7 +455,7 @@ def main():
     ap.add_argument("--release", default=RELEASE, help="where the trained checkpoints are downloaded from")
     ap.add_argument("--retrieval_check", type=int, default=2000, help="recorded queries to search again (0: skip)")
     ap.add_argument("--dtype", default=None, choices=["bfloat16", "float16", "float32"],
-                    help="model precision (default: bfloat16 if the GPU has it, else float16)")
+                    help="model precision (default: bfloat16 if the GPU has it, else float16, else float32)")
     ap.add_argument("--skip_tests", action="store_true")
     ap.add_argument("--skip_noise", action="store_true", help="skip the second run of the start policy")
     ap.add_argument("--fresh", action="store_true", help="rerun inference even when outputs exist")
@@ -413,58 +465,22 @@ def main():
     unknown = set(models) - set(MODELS)
     if unknown:
         sys.exit(f"unknown policies {sorted(unknown)}; choose from {list(MODELS)}")
+    os.makedirs(a.work, exist_ok=True)
     report = {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "minutes": {}}
     t_all = time.time()
-
-    if not a.compare_only:
-        env = report["environment"] = environment()
-        log(f"environment: {json.dumps({k: v for k, v in env.items() if k != 'warnings'})}")
-        for w in env["warnings"]:
-            log(f"WARNING: {w}.")
-        if not env["gpu"]:
-            sys.exit("No GPU found. In Colab: Runtime, Change runtime type, a GPU (T4 is enough, L4 is closest).")
-        dtype = report["dtype"] = a.dtype or ("bfloat16" if env["bf16"] else "float16")
-        if dtype != "bfloat16":
-            log(f"WARNING: running in {dtype}; every reported run used bfloat16 (an L4 has it, a T4 does not). More "
-                "answers will differ from the recorded runs than between two bfloat16 runs; the same rule judges them.")
-
-        if not a.skip_tests:
-            report["unit_tests"] = unit_tests()
-            log(f"unit tests: {report['unit_tests']['summary']}")
-            if not report["unit_tests"]["passed"]:
-                sys.exit(f"unit tests failed; run: python -m pytest -q {' '.join(TESTS)}")
-
-        os.makedirs(f"{a.work}/data", exist_ok=True)
-        for ds in SETS:
-            shutil.copy(f"{REPO}/data/{ds}_test.jsonl", f"{a.work}/data/")
-
-        t0 = time.time()
-        start_retriever(a.work)
-        if a.retrieval_check:
-            report["retrieval"] = retrieval_check(a.retrieval_check)
-            log(f"retrieval check: {json.dumps(report['retrieval'])}")
-        report["minutes"]["retriever"] = round((time.time() - t0) / 60, 1)
-
-        t0 = time.time()
-        paths = {m: BASE_MODEL if MODELS[m][0] == "hub" else fetch_checkpoint(m, a.work, a.release) for m in models}
-        report["minutes"]["checkpoints"] = round((time.time() - t0) / 60, 1)
-
-        for name, tasks, ood in plan(models):
-            base = name[:-4] if ood else name
-            mins = run_inference(a.work, name, paths[base], tasks, ood, a.fresh, dtype)
-            report["minutes"][f"{name}:{','.join(tasks)}"] = round(mins, 1)
-            share = format_share(a.work, name) if MODELS[base][0] == "release" and "agent" in tasks else None
-            if share is not None and share < 0.9:  # the trained policies answer well formed 99.6% of the time
-                sys.exit(f"{name}: only {share:.0%} of episodes end in a well formed answer, so the {dtype} outputs "
-                         "look broken. Rerun with --dtype float32 (slower) or on an L4.")
-
-        if "stageA2" in models and not a.skip_noise:
-            t0 = time.time()
-            report["noise"] = noise_check(a.work, paths["stageA2"], a.fresh, dtype)
-            report["minutes"]["noise"] = round((time.time() - t0) / 60, 1)
-
-    results = report["rows"] = compare(a.work, models)
-    report["verdict"] = verdict(results, report.get("retrieval"))
+    try:
+        if not a.compare_only:
+            run_pipeline(a, models, report)
+        results = report["rows"] = compare(a.work, models)
+        report["verdict"] = verdict(results, report.get("retrieval"))
+    except (Exception, SystemExit) as e:  # an early stop still leaves a report that says why
+        msg = str(e.code if isinstance(e, SystemExit) else e)
+        report["verdict"] = f"FAIL: stopped early. {msg}"
+        report["minutes"]["total"] = round((time.time() - t_all) / 60, 1)
+        with open(f"{a.work}/reproduce_report.json", "w") as f:
+            json.dump(report, f, indent=1)
+        log(f"VERDICT: {report['verdict']}")
+        sys.exit(1)
     report["minutes"]["total"] = round((time.time() - t_all) / 60, 1)
     with open(f"{a.work}/reproduce_report.json", "w") as f:
         json.dump(report, f, indent=1)
@@ -479,6 +495,59 @@ def main():
         f"{MARGIN_SC} (baselines without recorded answers: within {MARGIN_TABLE} point of the report)")
     log(f"VERDICT: {report['verdict']}   (details in {a.work}/reproduce_report.json)")
     sys.exit(0 if report["verdict"].startswith("PASS") else 1)
+
+
+def run_pipeline(a, models, report):
+    env = report["environment"] = environment()
+    log(f"environment: {json.dumps({k: v for k, v in env.items() if k != 'warnings'})}")
+    for w in env["warnings"]:
+        log(f"WARNING: {w}.")
+    if not env["gpu"]:
+        raise SystemExit("No GPU found. In Colab: Runtime, Change runtime type, a GPU (T4 is enough, L4 is closest).")
+
+    if not a.skip_tests:
+        report["unit_tests"] = unit_tests()
+        log(f"unit tests: {report['unit_tests']['summary']}")
+        if not report["unit_tests"]["passed"]:
+            raise SystemExit(f"unit tests failed; run: python -m pytest -q {' '.join(TESTS)}")
+
+    t0 = time.time()
+    paths = {m: BASE_MODEL if MODELS[m][0] == "hub" else fetch_checkpoint(m, a.work, a.release) for m in models}
+    report["minutes"]["checkpoints"] = round((time.time() - t0) / 60, 1)
+
+    t0 = time.time()
+    dtype, report["engine_check"] = pick_dtype(a.work, paths[models[0]], env, a.dtype)
+    report["dtype"] = dtype
+    report["minutes"]["engine_check"] = round((time.time() - t0) / 60, 1)
+    if dtype is None:
+        raise SystemExit("vLLM could not run the model on this GPU: " + " | ".join(report["engine_check"]))
+    if dtype != "bfloat16":
+        log(f"WARNING: running in {dtype}; every reported run used bfloat16 (an L4 has it, a T4 does not). More "
+            "answers will differ from the recorded runs than between two bfloat16 runs; the same rule judges them.")
+
+    os.makedirs(f"{a.work}/data", exist_ok=True)
+    for ds in SETS:
+        shutil.copy(f"{REPO}/data/{ds}_test.jsonl", f"{a.work}/data/")
+    t0 = time.time()
+    start_retriever(a.work)
+    if a.retrieval_check:
+        report["retrieval"] = retrieval_check(a.retrieval_check)
+        log(f"retrieval check: {json.dumps(report['retrieval'])}")
+    report["minutes"]["retriever"] = round((time.time() - t0) / 60, 1)
+
+    for name, tasks, ood in plan(models):
+        base = name[:-4] if ood else name
+        mins = run_inference(a.work, name, paths[base], tasks, ood, a.fresh, dtype)
+        report["minutes"][f"{name}:{','.join(tasks)}"] = round(mins, 1)
+        share = format_share(a.work, name) if MODELS[base][0] == "release" and "agent" in tasks else None
+        if share is not None and share < 0.9:  # the trained policies answer well formed 99.6% of the time
+            raise SystemExit(f"{name}: only {share:.0%} of episodes end in a well formed answer, so the {dtype} "
+                             "outputs look broken. Rerun with --dtype float32 (slower) or on an L4.")
+
+    if "stageA2" in models and not a.skip_noise:
+        t0 = time.time()
+        report["noise"] = noise_check(a.work, paths["stageA2"], a.fresh, dtype)
+        report["minutes"]["noise"] = round((time.time() - t0) / 60, 1)
 
 
 if __name__ == "__main__":
