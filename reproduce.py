@@ -1,10 +1,11 @@
 """Reproduces the report's evaluation results from the trained checkpoints. No training is run.
 
-Every number in the report was produced on an NVIDIA L4 with vLLM 0.31.0 and TRL 1.16.0, greedy decoding. Run this
-in Colab on an L4 (notebooks/10_reproduce_results.ipynb installs the same versions and runs it).
+Every number in the report was produced on an NVIDIA L4 with vLLM 0.31.0 and TRL 1.16.0, greedy decoding, bfloat16.
+notebooks/10_reproduce_results.ipynb installs the same versions in Colab and runs this script. It also runs on the
+free T4 GPU, which has no bfloat16: the policies then run in float16, and more answers differ from the recorded run.
 
 Steps
-  1. environment   GPU and library versions. bfloat16 is required; a GPU other than the L4 may change a few answers.
+  1. environment   GPU and library versions; bfloat16 where the GPU has it, else float16 (--dtype overrides).
   2. unit tests    test_sot.py, test_export_site.py, test_reproduce.py: scoring, rewards, agent loop, analysis,
                    export, and this script's comparison.
   3. retriever     setup_retriever.sh starts the BM25 server over Pyserini's prebuilt wikipedia-dpr-100w index. Then
@@ -12,9 +13,13 @@ Steps
                    the passages recorded at evaluation time.
   4. checkpoints   the base model from the Hugging Face Hub, the five trained policies from this repo's release.
   5. inference     run_inference.py with the same commands, task grouping and order as the original evaluation
-                   (notebooks 05 to 08), so vLLM sees the same batches.
-  6. comparison    every answer against the recorded run (docs/data, the demo page's data) and every EM / F1 / SC
-                   against the report's appendix table. Writes <work>/reproduce_report.json, prints PASS or FAIL.
+                   (notebooks 05 to 08).
+  6. noise         the start policy's in domain evaluation runs a second time, to measure how much two runs of the
+                   same command differ (vLLM's greedy decoding is not bit for bit repeatable, see below).
+  7. comparison    every policy and test set against the recorded run (docs/data, the demo page's data) with a
+                   paired bootstrap over the same questions, as in the report; the two baselines without recorded
+                   answers against the report's appendix table. Writes <work>/reproduce_report.json, prints PASS or
+                   FAIL.
 
 usage: python reproduce.py [--work /content/repro] [--policies base_0.5B,stageA2,...] [--compare_only]
 """
@@ -36,7 +41,8 @@ import zipfile
 REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
 import export_site as ex  # noqa: E402
-from sot.analysis import by_dataset, mean  # noqa: E402
+from sot.analysis import by_dataset, load_jsonl, mean, paired_bootstrap  # noqa: E402
+from sot.scoring import f1  # noqa: E402
 
 RELEASE = "https://github.com/Kodezilla0725/search_or_think/releases/download/checkpoints-v1"
 # SHA-256 of each release zip, taken on the uploader's machine before upload: a download that differs is refused.
@@ -89,15 +95,18 @@ REPORT = {
     "base_rag": [(15.9, 24.1, 1.00), (22.9, 28.2, 1.00), (2.0, 7.2, 1.00), (10.8, 17.6, 1.00), (23.2, 27.0, 1.00)],
 }
 
-# Verdicts per row and set.
-#   exact:   every answer and search count equals the recorded run (rows without a recorded run: EM / F1 / SC
-#            equal the report's table up to its rounding)
-#   close:   at least 97% of answers equal, and EM and F1 within 1 point and SC within 0.05 of the recorded run.
-#            For scale: the report's 95% intervals on paired F1 differences are about 2 to 5 points wide, and
-#            seeds of the same reward differ by up to 4 F1 points.
-#   differs: anything else. Any "differs" or missing result makes the run FAIL.
-ROUNDING = (0.06, 0.06, 0.006)  # the report rounds to 0.1 points (0.01 for SC); 0.06 allows its double rounding
-CLOSE_AGREE, CLOSE_POINTS, CLOSE_SC = 0.97, 1.0, 0.05
+# How a result is judged, per policy and test set. vLLM does not make greedy decoding bit for bit repeatable by
+# default (https://docs.vllm.ai/en/v0.31.0/usage/reproducibility/): batches are scheduled differently from run to
+# run, a few uncertain answers change, and a changed search query changes the rest of its episode. The original
+# evaluation ran the same way, so identical answers are not the test. The test is whether the numbers are the same:
+#   same:    the paired bootstrap 95% interval of the F1 difference (reproduced minus recorded, over the same
+#            questions, 2,000 resamples, as in the report) lies within MARGIN_F1 points, and SC is within MARGIN_SC.
+#            Two runs of the same command on the same L4 gave intervals reaching about 2 points (start policy, NQ),
+#            so 2.5 allows that noise; seeds of the same reward differ by up to 4 F1 points.
+#            The two base model baselines without recorded answers here (no search, RAG) need EM and F1 within
+#            MARGIN_TABLE points of the report's table instead.
+#   differs: anything else. A "differs" or missing result, or a retrieval check below MIN_RETRIEVAL, is a FAIL.
+MARGIN_F1, MARGIN_SC, MARGIN_TABLE, MIN_RETRIEVAL = 2.5, 0.1, 1.0, 0.99
 
 
 def log(msg):
@@ -249,13 +258,20 @@ def plan(models):
     return jobs
 
 
-def command(work, model_path, name, tasks, ood):
+def command(work, model_path, name, tasks, ood, dtype="bfloat16"):
     cmd = [sys.executable, "run_inference.py", "--project", work, *INF, "--model", model_path, "--name", name,
-           "--tasks", ",".join(tasks)]
+           "--tasks", ",".join(tasks), "--dtype", dtype]
     return cmd + (["--datasets", OOD] if ood else [])
 
 
-def run_inference(work, name, model_path, tasks, ood, fresh):
+def format_share(work, name):
+    """Share of a policy's agent episodes that end in a well formed answer (the trained policies: 99.6% or more)."""
+    path = f"{work}/outputs/{name}/agent.jsonl"
+    rows = load_jsonl(path) if os.path.exists(path) else []
+    return mean(r["format_ok"] for r in rows) if rows else None
+
+
+def run_inference(work, name, model_path, tasks, ood, fresh, dtype="bfloat16"):
     folder = f"{work}/outputs/{name}"
     if not fresh and all(os.path.exists(f"{folder}/{t}.jsonl") for t in tasks):
         log(f"{name}: {','.join(tasks)} already done, skipped (use --fresh to redo)")
@@ -265,7 +281,8 @@ def run_inference(work, name, model_path, tasks, ood, fresh):
     path = f"{work}/logs/{name}_{'_'.join(tasks)}.log"
     log(f"{name}: running {','.join(tasks)} (full log: {path})")
     with open(path, "w") as f:  # vLLM's progress bars go to the log; its summary lines are printed below
-        r = subprocess.run(command(work, model_path, name, tasks, ood), cwd=REPO, stdout=f, stderr=subprocess.STDOUT)
+        r = subprocess.run(command(work, model_path, name, tasks, ood, dtype), cwd=REPO, stdout=f,
+                           stderr=subprocess.STDOUT)
     with open(path) as f:
         lines = f.read().splitlines()
     if r.returncode != 0:
@@ -277,7 +294,24 @@ def run_inference(work, name, model_path, tasks, ood, fresh):
     return (time.time() - t0) / 60
 
 
-# 6. comparison
+# 6. noise
+def noise_check(work, model_path, fresh, dtype="bfloat16", n_boot=2000):
+    """Evaluates the start policy in domain a second time and compares the two runs: the noise between two runs of
+    the same command, measured rather than assumed."""
+    run_inference(work, "stageA2_rerun", model_path, ["agent"], False, fresh, dtype)
+    a = {r["id"]: r for r in load_jsonl(f"{work}/outputs/stageA2/agent.jsonl")}
+    b = {r["id"]: r for r in load_jsonl(f"{work}/outputs/stageA2_rerun/agent.jsonl")}
+    out = {}
+    for ds in ("hotpotqa", "nq"):
+        ids = [i for i in a if a[i]["dataset"] == ds and i in b]
+        same = sum((a[i]["answer"], a[i]["n_search"]) == (b[i]["answer"], b[i]["n_search"]) for i in ids)
+        bs = paired_bootstrap([a[i]["f1"] for i in ids], [b[i]["f1"] for i in ids], n_boot=n_boot)
+        out[ds] = {"same_answers": same, "n": len(ids),
+                   "f1_diff": [round(100 * bs[k], 2) for k in ("diff", "lo", "hi")]}
+    return out
+
+
+# 7. comparison
 def recorded_rows(rec_key):
     """id -> (answer, searches) for one recorded policy, from the demo data."""
     out = {}
@@ -290,25 +324,23 @@ def recorded_rows(rec_key):
     return out
 
 
-def judge(got, report, recorded, agree):
-    """got / report / recorded: (EM %, F1 %, SC). agree: share of equal answers, None without a recorded run."""
-    in_report = all(abs(g - e) <= t for g, e, t in zip(got, report, ROUNDING))
-    if agree is None:
-        if in_report:
-            return "exact"
-        ref, ok_agree = report, True
-    else:
-        if agree == 1.0:
-            return "exact"
-        ref, ok_agree = recorded, agree >= CLOSE_AGREE
-    near = abs(got[0] - ref[0]) <= CLOSE_POINTS and abs(got[1] - ref[1]) <= CLOSE_POINTS \
-        and abs(got[2] - ref[2]) <= CLOSE_SC
-    return "close" if ok_agree and near else "differs"
+def golds():
+    return {q["id"]: q["golds"] for ds in SETS for q in demo_data(ds)["questions"]}
 
 
-def compare(work, models=tuple(MODELS)):
+def judge(res):
+    got, sc_ref = res["got"], res["recorded"][2] if "recorded" in res else res["report"][2]
+    if abs(got[2] - sc_ref) > MARGIN_SC:
+        return "differs"
+    if "f1_diff" in res:
+        return "same" if max(abs(res["f1_diff"][1]), abs(res["f1_diff"][2])) <= MARGIN_F1 else "differs"
+    return "same" if all(abs(g - e) <= MARGIN_TABLE for g, e in zip(got[:2], res["report"][:2])) else "differs"
+
+
+def compare(work, models=tuple(MODELS), n_boot=2000):
     with open(f"{REPO}/docs/data/meta.json") as f:
         metrics = json.load(f)["metrics"]
+    gold = golds()
     results = []
     for key, label, folder, task, rec_key in ROWS:
         if folder not in models:
@@ -320,44 +352,48 @@ def compare(work, models=tuple(MODELS)):
         for i, ds in enumerate(SETS):
             res = {"row": key, "label": label, "set": ds, "report": list(REPORT[key][i])}
             v = groups.get(ds, [])
-            if len(v) != EXPECTED_N[ds]:
+            if len(v) != EXPECTED_N[ds] or (rec_key and any(r["id"] not in rec for r in v)):
                 res.update(status="missing" if not v else "differs", n=len(v),
-                           note=f"expected {EXPECTED_N[ds]} questions")
+                           note=f"expected the {EXPECTED_N[ds]} recorded questions")
                 results.append(res)
                 continue
             got = (100 * mean(r["em"] for r in v), 100 * mean(r["f1"] for r in v), mean(r["n_search"] for r in v))
             res.update(n=len(v), got=[round(got[0], 2), round(got[1], 2), round(got[2], 3)])
-            agree, recorded = None, None
             if rec_key:
                 m = metrics[rec_key][ds]
-                recorded = (100 * m["em"], 100 * m["f1"], m["sc"])
-                changed = [r["id"] for r in v if rec.get(r["id"]) != (r["answer"], r["n_search"])]
-                agree = 1 - len(changed) / len(v)
-                res.update(recorded=[round(x, 2) for x in recorded], same_answers=len(v) - len(changed),
-                           changed=changed[:5])
-            res["status"] = judge(got, REPORT[key][i], recorded, agree)
+                changed = [r["id"] for r in v if rec[r["id"]] != (r["answer"], r["n_search"])]
+                bs = paired_bootstrap([f1(rec[r["id"]][0], gold[r["id"]]) for r in v], [r["f1"] for r in v],
+                                      n_boot=n_boot)
+                res.update(recorded=[round(100 * m["em"], 2), round(100 * m["f1"], 2), round(m["sc"], 3)],
+                           f1_diff=[round(100 * bs[k], 2) for k in ("diff", "lo", "hi")],
+                           same_answers=len(v) - len(changed), changed=changed[:5])
+            res["status"] = judge(res)
             results.append(res)
     return results
 
 
-def verdict(results):
+def verdict(results, retrieval=None):
     run = [r for r in results if r["status"] != "not run"]
-    if not run or any(r["status"] in ("differs", "missing") for r in run):
+    if not run or any(r["status"] != "same" for r in run):
         return "FAIL"
-    v = "PASS (exact)" if all(r["status"] == "exact" for r in run) else "PASS (close)"
-    return v + (f", {len(results) - len(run)} of {len(results)} rows not run" if len(run) < len(results) else "")
+    if retrieval is not None and retrieval["agreement"] < MIN_RETRIEVAL:
+        return "FAIL"
+    return "PASS" + (f" ({len(results) - len(run)} of {len(results)} results not run)" if len(run) < len(results)
+                     else "")
 
 
 def print_table(results):
-    log("row               set        EM     F1     SC   | report EM   F1    SC  | same answers | status")
+    log("policy            set        EM     F1     SC | report EM   F1    SC | F1 vs recorded [95% CI] | same answers"
+        " | status")
     for r in results:
         if "got" not in r:
-            log(f"{r['label']:<17} {r['set']:<9} {'':>20} | {'':>21} | {r.get('n', 0):>12} | {r['status']}")
+            log(f"{r['label']:<17} {r['set']:<9} {r['status']}")
             continue
         g, e = r["got"], r["report"]
-        same = f"{r['same_answers']}/{r['n']}" if "same_answers" in r else "n/a"
-        log(f"{r['label']:<17} {r['set']:<9} {g[0]:6.2f} {g[1]:6.2f} {g[2]:6.2f} | "
-            f"{e[0]:9.1f} {e[1]:5.1f} {e[2]:5.2f} | {same:>12} | {r['status']}")
+        d = "{:+.2f} [{:+.2f}, {:+.2f}]".format(*r["f1_diff"]) if "f1_diff" in r else "no recorded answers"
+        same = f"{r['same_answers']}/{r['n']}" if "same_answers" in r else ""
+        log(f"{r['label']:<17} {r['set']:<9} {g[0]:6.2f} {g[1]:6.2f} {g[2]:6.2f} | {e[0]:9.1f} {e[1]:5.1f} "
+            f"{e[2]:5.2f} | {d:>23} | {same:>12} | {r['status']}")
 
 
 def main():
@@ -366,7 +402,10 @@ def main():
     ap.add_argument("--policies", default=",".join(MODELS), help="output folders to run, comma separated")
     ap.add_argument("--release", default=RELEASE, help="where the trained checkpoints are downloaded from")
     ap.add_argument("--retrieval_check", type=int, default=2000, help="recorded queries to search again (0: skip)")
+    ap.add_argument("--dtype", default=None, choices=["bfloat16", "float16", "float32"],
+                    help="model precision (default: bfloat16 if the GPU has it, else float16)")
     ap.add_argument("--skip_tests", action="store_true")
+    ap.add_argument("--skip_noise", action="store_true", help="skip the second run of the start policy")
     ap.add_argument("--fresh", action="store_true", help="rerun inference even when outputs exist")
     ap.add_argument("--compare_only", action="store_true", help="only compare outputs already in --work")
     a = ap.parse_args()
@@ -381,9 +420,13 @@ def main():
         env = report["environment"] = environment()
         log(f"environment: {json.dumps({k: v for k, v in env.items() if k != 'warnings'})}")
         for w in env["warnings"]:
-            log(f"WARNING: {w}. A few answers may differ from the recorded runs.")
-        if not env["bf16"]:
-            sys.exit("A GPU with bfloat16 is required (the policies run in bfloat16): use an L4 or A100.")
+            log(f"WARNING: {w}.")
+        if not env["gpu"]:
+            sys.exit("No GPU found. In Colab: Runtime, Change runtime type, a GPU (T4 is enough, L4 is closest).")
+        dtype = report["dtype"] = a.dtype or ("bfloat16" if env["bf16"] else "float16")
+        if dtype != "bfloat16":
+            log(f"WARNING: running in {dtype}; every reported run used bfloat16 (an L4 has it, a T4 does not). More "
+                "answers will differ from the recorded runs than between two bfloat16 runs; the same rule judges them.")
 
         if not a.skip_tests:
             report["unit_tests"] = unit_tests()
@@ -408,11 +451,20 @@ def main():
 
         for name, tasks, ood in plan(models):
             base = name[:-4] if ood else name
-            mins = run_inference(a.work, name, paths[base], tasks, ood, a.fresh)
+            mins = run_inference(a.work, name, paths[base], tasks, ood, a.fresh, dtype)
             report["minutes"][f"{name}:{','.join(tasks)}"] = round(mins, 1)
+            share = format_share(a.work, name) if MODELS[base][0] == "release" and "agent" in tasks else None
+            if share is not None and share < 0.9:  # the trained policies answer well formed 99.6% of the time
+                sys.exit(f"{name}: only {share:.0%} of episodes end in a well formed answer, so the {dtype} outputs "
+                         "look broken. Rerun with --dtype float32 (slower) or on an L4.")
+
+        if "stageA2" in models and not a.skip_noise:
+            t0 = time.time()
+            report["noise"] = noise_check(a.work, paths["stageA2"], a.fresh, dtype)
+            report["minutes"]["noise"] = round((time.time() - t0) / 60, 1)
 
     results = report["rows"] = compare(a.work, models)
-    report["verdict"] = verdict(results)
+    report["verdict"] = verdict(results, report.get("retrieval"))
     report["minutes"]["total"] = round((time.time() - t_all) / 60, 1)
     with open(f"{a.work}/reproduce_report.json", "w") as f:
         json.dump(report, f, indent=1)
@@ -420,6 +472,11 @@ def main():
     if "retrieval" in report:
         r = report["retrieval"]
         log(f"retrieval: {r['same_passages']} of {r['queries']} recorded queries returned the recorded passages")
+    for ds, n in report.get("noise", {}).items():
+        log(f"noise: two runs of the same command here, start policy on {ds}: {n['same_answers']}/{n['n']} answers "
+            "identical, F1 difference {:+.2f} [{:+.2f}, {:+.2f}]".format(*n["f1_diff"]))
+    log(f"rule: same = the 95% interval of the F1 difference lies within +-{MARGIN_F1} points and SC within "
+        f"{MARGIN_SC} (baselines without recorded answers: within {MARGIN_TABLE} point of the report)")
     log(f"VERDICT: {report['verdict']}   (details in {a.work}/reproduce_report.json)")
     sys.exit(0 if report["verdict"].startswith("PASS") else 1)
 

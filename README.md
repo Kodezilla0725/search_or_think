@@ -15,7 +15,7 @@ We trained Qwen2.5-0.5B-Instruct with multi-turn GRPO to answer questions with a
 | `notebooks/01` to `08` | The Colab notebooks that ran the project, in order, with their outputs: interim baselines, the p(q) fix, the GRPO smoke test, stage 0 fixes, stage A, stage A2 (forced exploration), stage B (the four rewards), and the evaluation on five test sets. |
 | `notebooks/09_search_or_think_demo_export.ipynb` | Reads the saved evaluation outputs and writes the demo page's data (`docs/data/`). CPU only; nothing is rerun. |
 | `notebooks/10_reproduce_results.ipynb` | Reproduces the evaluation results from the trained checkpoints (see below). |
-| `sot/`, `train_grpo.py`, `run_inference.py`, `retriever_server.py`, `setup_retriever.sh`, `test_sot.py` | The project code, exactly as notebook 08 writes it. |
+| `sot/`, `train_grpo.py`, `run_inference.py`, `retriever_server.py`, `setup_retriever.sh`, `test_sot.py` | The project code, exactly as notebook 08 writes it, except a `--dtype` option in `run_inference.py` (default bfloat16, as evaluated) for GPUs without bfloat16. |
 | `reproduce.py`, `test_reproduce.py` | The reproduction pipeline behind notebook 10, and its tests. |
 | `export_site.py`, `test_export_site.py` | The export behind notebook 09, and its tests. |
 | `data/` | The five test sets, exactly as evaluated: HotpotQA (1,000 dev questions), NQ-open (the first 500 are used), and the FlashRAG copies of 2WikiMultihopQA (1,000), MuSiQue (500) and PopQA (500). |
@@ -23,14 +23,17 @@ We trained Qwen2.5-0.5B-Instruct with multi-turn GRPO to answer questions with a
 
 ## Reproducing the results
 
-Open `notebooks/10_reproduce_results.ipynb` in Colab on an **NVIDIA L4** GPU and run all cells. No Google Drive and no training are needed. It runs `reproduce.py`, which:
+Open `notebooks/10_reproduce_results.ipynb` in Colab on a GPU and run all cells. The free T4 works; an **NVIDIA L4** (the GPU of the original evaluation) gives the closest match. No Google Drive and no training are needed. It runs `reproduce.py`, which:
 
-1. checks the GPU and library versions (the evaluation used an L4, vLLM 0.31.0 and TRL 1.16.0; the policies need bfloat16, so the free T4 GPU cannot run them);
+1. checks the GPU and library versions (the evaluation used an L4, vLLM 0.31.0 and TRL 1.16.0, bfloat16), and runs the policies in bfloat16 where the GPU has it, else in float16 (the T4);
 2. runs the unit tests;
 3. starts the BM25 search server over Pyserini's prebuilt `wikipedia-dpr-100w` index, and checks that 2,000 queries from the recorded runs retrieve the same top 3 passages as at evaluation time;
-4. downloads the untrained Qwen2.5-0.5B-Instruct from the Hugging Face Hub and the five trained policies from this repository's [release](https://github.com/Kodezilla0725/search_or_think/releases): the start policy (stage A2), plain GRPO, fixed penalty (lambda 0.05), SAAS and Soft-SAAS, seed 0 each;
+4. downloads the untrained Qwen2.5-0.5B-Instruct from the Hugging Face Hub and the five trained policies from this repository's [release](https://github.com/Kodezilla0725/search_or_think/releases) (each checked against its SHA-256): the start policy (stage A2), plain GRPO, fixed penalty (lambda 0.05), SAAS and Soft-SAAS, seed 0 each;
 5. evaluates them with greedy decoding on all five test sets, with the same commands as the original evaluation;
-6. compares every answer with the recorded run and every EM, F1 and search count with the report's appendix table, and prints PASS or FAIL. A result is *exact* when every answer matches, and *close* when at least 97% of answers match and EM and F1 are within 1 point. Anything else fails.
+6. evaluates the start policy a second time, to measure how much two runs of the same command differ;
+7. compares every policy on every test set with the recorded run, and prints PASS or FAIL.
+
+vLLM does not make greedy decoding bit for bit repeatable by default ([vLLM docs](https://docs.vllm.ai/en/v0.31.0/usage/reproducibility/)): requests are batched differently from run to run, so a few uncertain answers change. In our own run on an L4, two runs of the same command agreed on 79% of HotpotQA answers while their F1 differed by 0.4 points. So the test is not identical answers but the same numbers: for each policy and test set, the paired bootstrap 95% interval of the F1 difference between the reproduced and the recorded run (the report's own test) must lie within ±2.5 points, and the search count within 0.1. On a T4, float16 arithmetic changes more answers than that; the same rule judges the numbers. The full run takes about an hour on an L4, longer on a T4.
 
 Training is not part of the reproduction: the 22 GRPO runs took many hours of GPU time. Notebooks 01 to 08 contain the exact training commands and their logs.
 

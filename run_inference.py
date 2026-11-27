@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--tag", default="")
     ap.add_argument("--max_model_len", type=int, default=8192)
     ap.add_argument("--gpu_mem", type=float, default=0.85)
+    ap.add_argument("--dtype", default="bfloat16",
+                    help="model precision; every reported run used bfloat16 (float16 / float32 for GPUs without it)")
     args = ap.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -88,7 +90,7 @@ def main():
     out_dir = os.path.join(args.project, "outputs", name)
     os.makedirs(out_dir, exist_ok=True)
 
-    llm = LLM(model=args.model, dtype="bfloat16", gpu_memory_utilization=args.gpu_mem,
+    llm = LLM(model=args.model, dtype=args.dtype, gpu_memory_utilization=args.gpu_mem,
               max_model_len=args.max_model_len, seed=0, enable_prefix_caching=True)
     tok = llm.get_tokenizer()
     retrieve = Retriever(k=3)

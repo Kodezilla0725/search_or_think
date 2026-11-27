@@ -18,7 +18,8 @@ def test_plan_follows_the_original_evaluation():
     cmd = rp.command("/w", "/w/checkpoints/B_saas_s0/final", "B_saas_s0_ood", ["agent"], True)
     assert cmd[1:] == ["run_inference.py", "--project", "/w", "--n", "1000", "--n_nq", "500", "--model",
                        "/w/checkpoints/B_saas_s0/final", "--name", "B_saas_s0_ood", "--tasks", "agent",
-                       "--datasets", "2wiki,musique,popqa"]
+                       "--dtype", "bfloat16", "--datasets", "2wiki,musique,popqa"]
+    assert rp.command("/w", "m", "stageA2", ["agent"], False, "float16")[-2:] == ["--dtype", "float16"]
     assert "--datasets" not in rp.command("/w", "m", "stageA2", ["no_search", "rag"], False)
 
 
@@ -84,12 +85,13 @@ def work(tmp_path_factory):
     return w
 
 
-def test_recorded_runs_reproduce_exactly_and_match_the_report(work):
-    results = rp.compare(work)
-    assert {r["status"] for r in results} == {"exact"}
-    assert rp.verdict(results) == "PASS (exact)"
-    for r in results:  # rescored answers land on the report's appendix table, within its rounding
-        assert all(abs(g - e) <= t for g, e, t in zip(r["got"], r["report"], rp.ROUNDING)), r
+def test_recorded_runs_are_the_same_and_match_the_report(work):
+    results = rp.compare(work, n_boot=200)
+    assert {r["status"] for r in results} == {"same"}
+    assert rp.verdict(results) == "PASS"
+    for r in results:  # rescored answers land on the report's appendix table, within its rounding (0.06)
+        assert all(abs(g - e) <= t for g, e, t in zip(r["got"], r["report"], (0.06, 0.06, 0.006))), r
+        assert r.get("f1_diff", [0, 0, 0]) == [0, 0, 0]
 
 
 def _edit(work, folder, task, ds, n_changed):
@@ -110,25 +112,57 @@ def _status(results, row, ds):
     return next(r["status"] for r in results if r["row"] == row and r["set"] == ds)
 
 
-def test_a_few_changed_answers_are_close_and_many_fail(work):
-    path, original = _edit(work, "B_saas_s0", "agent", "hotpotqa", 5)
+def test_noise_sized_changes_pass_and_real_changes_fail(work):
+    path, original = _edit(work, "B_saas_s0", "agent", "hotpotqa", 30)
     try:
-        results = rp.compare(work)
-        assert _status(results, "saas", "hotpotqa") == "close"
-        assert rp.verdict(results) == "PASS (close)"
-        _edit(work, "B_saas_s0", "agent", "hotpotqa", 100)
-        results = rp.compare(work)
+        results = rp.compare(work, n_boot=200)
+        r = next(x for x in results if x["row"] == "saas" and x["set"] == "hotpotqa")
+        assert r["same_answers"] == 970 and r["f1_diff"][0] < 0 and r["status"] == "same"
+        assert rp.verdict(results) == "PASS"
+        _edit(work, "B_saas_s0", "agent", "hotpotqa", 300)
+        results = rp.compare(work, n_boot=200)
         assert _status(results, "saas", "hotpotqa") == "differs" and rp.verdict(results) == "FAIL"
     finally:
         with open(path, "w") as f:
             f.writelines(json.dumps(r) + "\n" for r in original)
 
 
+def test_search_count_and_retrieval_gates():
+    res = {"got": [20.0, 27.0, 1.2], "report": [20.0, 27.0, 1.0], "recorded": [20.0, 27.0, 1.0],
+           "f1_diff": [0.0, -0.5, 0.5]}
+    assert rp.judge(res) == "differs"
+    res["got"][2] = 1.05
+    assert rp.judge(res) == "same"
+    table = {"got": [7.7, 14.2, 0.0], "report": [7.3, 13.9, 0.0]}
+    assert rp.judge(table) == "same" and rp.judge({**table, "got": [7.7, 15.2, 0.0]}) == "differs"
+    ok = [{"status": "same"}]
+    assert rp.verdict(ok, {"agreement": 1.0}) == "PASS" and rp.verdict(ok, {"agreement": 0.98}) == "FAIL"
+
+
+def test_noise_check_compares_two_runs_of_the_start_policy(tmp_path, monkeypatch):
+    first = [{"id": f"h{i}", "dataset": "hotpotqa", "answer": "a", "n_search": 2, "f1": 1.0, "format_ok": True}
+             for i in range(10)]
+    first += [{"id": f"n{i}", "dataset": "nq", "answer": "b", "n_search": 1, "f1": 0.0, "format_ok": True}
+              for i in range(4)]
+    second = [dict(r, answer="c", f1=0.0) if r["id"] == "h0" else r for r in first]
+    for name, rows in (("stageA2", first), ("stageA2_rerun", second)):
+        os.makedirs(tmp_path / "outputs" / name)
+        with open(tmp_path / "outputs" / name / "agent.jsonl", "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+    calls = []
+    monkeypatch.setattr(rp, "run_inference", lambda *a: calls.append(a[1:4] + a[6:]))
+    out = rp.noise_check(str(tmp_path), "ckpt", False, "float16", n_boot=200)
+    assert calls == [("stageA2_rerun", "ckpt", ["agent"], "float16")]
+    assert rp.format_share(str(tmp_path), "stageA2") == 1.0 and rp.format_share(str(tmp_path), "none") is None
+    assert out["hotpotqa"]["same_answers"] == 9 and out["hotpotqa"]["f1_diff"][0] == -10.0
+    assert out["nq"] == {"same_answers": 4, "n": 4, "f1_diff": [0.0, 0.0, 0.0]}
+
+
 def test_missing_outputs_fail_and_unselected_policies_are_not_run(work, tmp_path):
-    assert rp.verdict(rp.compare(str(tmp_path))) == "FAIL"
-    results = rp.compare(work, models=("B_saas_s0",))
+    assert rp.verdict(rp.compare(str(tmp_path), n_boot=200)) == "FAIL"
+    results = rp.compare(work, models=("B_saas_s0",), n_boot=200)
     assert {r["status"] for r in results if r["row"] != "saas"} == {"not run"}
-    assert rp.verdict(results).startswith("PASS (exact), 45 of 50 rows not run")
+    assert rp.verdict(results) == "PASS (45 of 50 results not run)"
 
 
 def test_checkpoint_download_is_verified(tmp_path, monkeypatch):
