@@ -1,5 +1,8 @@
 # Search or Think? Soft Knowledge Boundaries for Cost-Aware Retrieval in Small Language Models
 
+[![tests](https://github.com/Kodezilla0725/search_or_think/actions/workflows/tests.yml/badge.svg)](https://github.com/Kodezilla0725/search_or_think/actions/workflows/tests.yml)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kodezilla0725/search_or_think/blob/main/notebooks/10_reproduce_results.ipynb)
+
 MSAI 635 Reinforcement Learning, final project.
 
 **Team:** Dhairya Parikh ([Dhairya2412](https://github.com/Dhairya2412)) and Kshitij Sahu ([Kodezilla0725](https://github.com/Kodezilla0725)).
@@ -23,7 +26,7 @@ We trained Qwen2.5-0.5B-Instruct with multi-turn GRPO to answer questions with a
 
 ## Reproducing the results
 
-Open `notebooks/10_reproduce_results.ipynb` in Colab on a GPU and run all cells. The free T4 works; an **NVIDIA L4** (the GPU of the original evaluation) gives the closest match. No Google Drive and no training are needed. It runs `reproduce.py`, which:
+Open `notebooks/10_reproduce_results.ipynb` in Colab (the **Open in Colab** button at the top) on a GPU and run all cells. The free T4 works; an **NVIDIA L4** (the GPU of the original evaluation) gives the closest match. No Google Drive and no training are needed. It runs `reproduce.py`, which:
 
 1. checks the GPU and library versions (the evaluation used an L4, vLLM 0.31.0 and TRL 1.16.0, bfloat16);
 2. runs the unit tests;
@@ -39,6 +42,8 @@ vLLM does not make greedy decoding bit for bit repeatable by default ([vLLM docs
 Training is not part of the reproduction: the 22 GRPO runs took many hours of GPU time. Notebooks 01 to 08 contain the exact training commands and their logs.
 
 ## Running the tests
+
+The **tests** badge at the top shows whether these pass on GitHub's servers after the latest commit (CPU only; the GPU reproduction is notebook 10).
 
 ```bash
 pip install pytest requests
